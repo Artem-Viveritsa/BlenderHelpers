@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+*.blend1
+*.blend2
+.github/

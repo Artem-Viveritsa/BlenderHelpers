@@ -1,0 +1,11 @@
+schema_version = "1.0.0"
+id = "helpers"
+version = "0.1.0"
+name = "Helpers"
+tagline = "A set of helper tools that simplifies everyday Blender workflows"
+maintainer = "Artem Viveritsa"
+type = "add-on"
+tags = ["Modeling"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Artem Viveritsa"]
