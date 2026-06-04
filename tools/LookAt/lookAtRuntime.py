@@ -19,7 +19,6 @@ MANUAL_ROTATION_TOLERANCE = 1e-4
 MANUAL_DISTANCE_TOLERANCE = 1e-4
 EPSILON = 1e-12
 SMALL_EPSILON = 1e-6
-WORLD_X_VECTOR = Vector((1.0, 0.0, 0.0))
 WORLD_Y_VECTOR = Vector((0.0, 1.0, 0.0))
 WORLD_UP_VECTOR = Vector((0.0, 0.0, 1.0))
 VIEW_FORWARD_VECTOR = Vector((0.0, 0.0, -1.0))
@@ -291,6 +290,19 @@ def _createCameraAnimationState(
     }
 
 
+def _iterView3DRegions(screen):
+    """Yield (area, region3d) tuples for every 3D viewport region in the screen."""
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+
+        for space in area.spaces:
+            if space.type != "VIEW_3D" or space.region_3d is None:
+                continue
+
+            yield area, space.region_3d
+
+
 def _createViewAnimationStates(
     context,
     targetLocation,
@@ -307,35 +319,27 @@ def _createViewAnimationStates(
 
     viewStates = []
 
-    for area in screen.areas:
-        if area.type != "VIEW_3D":
+    for area, region3d in _iterView3DRegions(screen):
+        if region3d.view_perspective == "CAMERA":
             continue
 
-        for space in area.spaces:
-            if space.type != "VIEW_3D" or space.region_3d is None:
-                continue
+        targetRotation = _calculateLookAtRotation(
+            viewDirection,
+            region3d.view_rotation,
+            shouldConstrainOrbit,
+        )
+        if targetRotation is None:
+            continue
 
-            region3d = space.region_3d
-            if region3d.view_perspective == "CAMERA":
-                continue
-
-            targetRotation = _calculateLookAtRotation(
-                viewDirection,
-                region3d.view_rotation,
-                shouldConstrainOrbit,
-            )
-            if targetRotation is None:
-                continue
-
-            viewStates.append(
-                {
-                    "area": area,
-                    "region3d": region3d,
-                    "targetLocation": targetLocation.copy(),
-                    "targetRotation": targetRotation,
-                    "targetDistance": max(region3d.view_distance, MINIMUM_CAMERA_DISTANCE),
-                }
-            )
+        viewStates.append(
+            {
+                "area": area,
+                "region3d": region3d,
+                "targetLocation": targetLocation.copy(),
+                "targetRotation": targetRotation,
+                "targetDistance": max(region3d.view_distance, MINIMUM_CAMERA_DISTANCE),
+            }
+        )
 
     return viewStates
 
@@ -346,7 +350,7 @@ def _animateCameraState(cameraState, interpolationFactor):
 
     try:
         cameraObject = cameraState["cameraObject"]
-        currentLocation = cameraObject.matrix_world.translation.copy()
+        currentLocation = cameraObject.matrix_world.translation
         currentRotation = cameraObject.matrix_world.to_quaternion()
         targetLocation = cameraState["targetLocation"]
         targetRotation = cameraState["targetRotation"]
@@ -355,8 +359,8 @@ def _animateCameraState(cameraState, interpolationFactor):
         cameraObject.matrix_world = Matrix.LocRotScale(
             cameraLocation, cameraRotation, cameraState["scale"]
         )
-        cameraState["lastAppliedLocation"] = cameraLocation.copy()
-        cameraState["lastAppliedRotation"] = cameraRotation.copy()
+        cameraState["lastAppliedLocation"] = cameraLocation
+        cameraState["lastAppliedRotation"] = cameraRotation
     except ReferenceError:
         return
 
@@ -365,8 +369,8 @@ def _animateViewStates(viewStates, interpolationFactor):
     for viewState in viewStates:
         try:
             region3d = viewState["region3d"]
-            currentLocation = region3d.view_location.copy()
-            currentRotation = region3d.view_rotation.copy()
+            currentLocation = region3d.view_location
+            currentRotation = region3d.view_rotation
             currentDistance = region3d.view_distance
             targetLocation = viewState["targetLocation"]
             targetRotation = viewState["targetRotation"]
@@ -381,8 +385,8 @@ def _animateViewStates(viewStates, interpolationFactor):
             region3d.view_distance = currentDistance + (
                 targetDistance - currentDistance
             ) * interpolationFactor
-            viewState["lastAppliedLocation"] = region3d.view_location.copy()
-            viewState["lastAppliedRotation"] = region3d.view_rotation.copy()
+            viewState["lastAppliedLocation"] = region3d.view_location
+            viewState["lastAppliedRotation"] = region3d.view_rotation
             viewState["lastAppliedDistance"] = region3d.view_distance
 
             viewState["area"].tag_redraw()
@@ -452,8 +456,7 @@ def _isFaceSnapEnabled(scene):
 
     snapElements = getattr(toolSettings, "snap_elements", None)
     if snapElements is None:
-        snapElement = getattr(toolSettings, "snap_element", "")
-        return "FACE" in snapElement
+        return False
 
     return any("FACE" in snapElement for snapElement in snapElements)
 
@@ -488,7 +491,7 @@ def _hasActiveObjectTransformUpdate(depsgraph, activeObject):
 
 
 def _findNearestFaceHit(context, scene, depsgraph, activeObject, targetObject):
-    sourceLocation = activeObject.matrix_world.translation.copy()
+    sourceLocation = activeObject.matrix_world.translation
     searchDistance = _calculateSearchDistance(activeObject)
     nearestFaceHit = None
 
@@ -543,13 +546,6 @@ def _iterateTargetMeshObjects(context, scene, activeObject, targetObject):
 def _isObjectVisibleInViewLayer(candidateObject, viewLayer):
     try:
         return candidateObject.visible_get(view_layer=viewLayer)
-    except TypeError:
-        pass
-    except RuntimeError:
-        return False
-
-    try:
-        return candidateObject.visible_get()
     except RuntimeError:
         return False
 
@@ -595,9 +591,9 @@ def _calculateSearchDistance(activeObject):
 def _calculateLocalSearchDistance(worldToLocalMatrix, searchDistance):
     worldToLocalBasis = worldToLocalMatrix.to_3x3()
     localScale = max(
-        (worldToLocalBasis @ WORLD_X_VECTOR).length,
-        (worldToLocalBasis @ WORLD_Y_VECTOR).length,
-        (worldToLocalBasis @ WORLD_UP_VECTOR).length,
+        worldToLocalBasis.col[0].length,
+        worldToLocalBasis.col[1].length,
+        worldToLocalBasis.col[2].length,
     )
 
     return searchDistance * max(localScale, SMALL_EPSILON)
@@ -642,18 +638,10 @@ def _getFirstView3DOffset(context, targetLocation):
     if screen is None:
         return None
 
-    for area in screen.areas:
-        if area.type != "VIEW_3D":
-            continue
-
-        for space in area.spaces:
-            if space.type != "VIEW_3D" or space.region_3d is None:
-                continue
-
-            region3d = space.region_3d
-            viewDirection = region3d.view_rotation @ VIEW_FORWARD_VECTOR
-            viewLocation = region3d.view_location - viewDirection * region3d.view_distance
-            return viewLocation - targetLocation
+    for _area, region3d in _iterView3DRegions(screen):
+        viewDirection = region3d.view_rotation @ VIEW_FORWARD_VECTOR
+        viewLocation = region3d.view_location - viewDirection * region3d.view_distance
+        return viewLocation - targetLocation
 
     return None
 

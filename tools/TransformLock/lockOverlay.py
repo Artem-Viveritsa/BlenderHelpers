@@ -5,6 +5,7 @@ from gpu_extras.batch import batch_for_shader
 
 _overlayHandler = None
 _overlayShader = None
+_batchCache = {}
 
 _lockOverlayColor = (0.0, 0.0, 0.0)
 _hatchSpacing = 18.0
@@ -22,20 +23,14 @@ def addOverlayHandler():
 
 
 def removeOverlayHandler():
-    global _overlayHandler
+    global _overlayHandler, _overlayShader
 
     if _overlayHandler is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_overlayHandler, "WINDOW")
         _overlayHandler = None
 
-
-def _tagView3DAreasForRedraw(context):
-    screen = getattr(context, "screen", None)
-
-    if screen is not None:
-        for area in screen.areas:
-            if area.type == "VIEW_3D":
-                area.tag_redraw()
+    _batchCache.clear()
+    _overlayShader = None
 
 
 def syncOverlayHandlerVisibility(windowManagerSettings, context):
@@ -44,7 +39,11 @@ def syncOverlayHandlerVisibility(windowManagerSettings, context):
     else:
         removeOverlayHandler()
 
-    _tagView3DAreasForRedraw(context)
+    screen = getattr(context, "screen", None)
+    if screen is not None:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
 
 
 def _getOverlayShader():
@@ -119,6 +118,20 @@ def _getOverlayShader():
     return _overlayShader
 
 
+def _getCachedMeshBatch(shader, depsgraph, transformSource, sourceObject):
+    cacheKey = sourceObject.session_uid
+    cachedEntry = _batchCache.get(cacheKey)
+
+    if cachedEntry is not None:
+        cachedDepsgraph, cachedBatch = cachedEntry
+        if cachedDepsgraph == depsgraph:
+            return cachedBatch
+
+    batch = _buildMeshBatch(shader, depsgraph, transformSource, sourceObject)
+    _batchCache[cacheKey] = (depsgraph, batch)
+    return batch
+
+
 def _buildMeshBatch(shader, depsgraph, transformSource, sourceObject):
     evaluatedObject = sourceObject.evaluated_get(depsgraph)
     mesh = evaluatedObject.to_mesh()
@@ -152,24 +165,16 @@ def _drawOverlayStripes(shader, batch, opacity, activeLockFlags):
 
 def _getActiveLockFlags(selectedObject, sceneSettings):
     return (
-        sceneSettings.showLocationLocksInOverlay and _hasLocationLock(selectedObject),
+        sceneSettings.showLocationLocksInOverlay and any(selectedObject.lock_location),
         sceneSettings.showRotationLocksInOverlay and _hasRotationLock(selectedObject),
-        sceneSettings.showScaleLocksInOverlay and _hasScaleLock(selectedObject),
+        sceneSettings.showScaleLocksInOverlay and any(selectedObject.lock_scale),
     )
-
-
-def _hasLocationLock(selectedObject):
-    return any(selectedObject.lock_location)
 
 
 def _hasRotationLock(selectedObject):
     return any(selectedObject.lock_rotation) or (
         selectedObject.lock_rotations_4d and selectedObject.lock_rotation_w
     )
-
-
-def _hasScaleLock(selectedObject):
-    return any(selectedObject.lock_scale)
 
 
 def _iterateOverlayObjects(context, depsgraph, sceneSettings):
@@ -186,7 +191,7 @@ def _iterateOverlayObjects(context, depsgraph, sceneSettings):
         if not any(activeLockFlags):
             continue
 
-        activeLockFlagsByObjectId[originalObject.as_pointer()] = activeLockFlags
+        activeLockFlagsByObjectId[originalObject.session_uid] = activeLockFlags
         yield visibleObject, originalObject, activeLockFlags
 
     for objectInstance in depsgraph.object_instances:
@@ -198,7 +203,7 @@ def _iterateOverlayObjects(context, depsgraph, sceneSettings):
         if originalObject.type != "MESH":
             continue
 
-        objectId = originalObject.as_pointer()
+        objectId = originalObject.session_uid
         activeLockFlags = activeLockFlagsByObjectId.get(objectId)
 
         if activeLockFlags is None:
@@ -259,7 +264,7 @@ def _drawOverlay():
         for transformSource, sourceObject, activeLockFlags in _iterateOverlayObjects(
             context, depsgraph, sceneSettings
         ):
-            batch = _buildMeshBatch(shader, depsgraph, transformSource, sourceObject)
+            batch = _getCachedMeshBatch(shader, depsgraph, transformSource, sourceObject)
 
             if batch is not None:
                 _drawOverlayStripes(
