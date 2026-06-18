@@ -1,5 +1,6 @@
 import bpy
 import gpu
+from bpy.app.handlers import persistent
 from gpu_extras.batch import batch_for_shader
 
 
@@ -11,6 +12,8 @@ _lockOverlayColor = (0.0, 0.0, 0.0)
 _hatchSpacing = 18.0
 _stripeWidth = 4.0
 _depthOffset = 1e-4
+_redrawIdTypes = {"OBJECT", "COLLECTION"}
+_clearCacheIdTypes = {"MESH"}
 
 
 def addOverlayHandler():
@@ -21,6 +24,8 @@ def addOverlayHandler():
             _drawOverlay, (), "WINDOW", "POST_VIEW"
         )
 
+    _addDepsgraphHandler()
+
 
 def removeOverlayHandler():
     global _overlayHandler, _overlayShader
@@ -29,6 +34,7 @@ def removeOverlayHandler():
         bpy.types.SpaceView3D.draw_handler_remove(_overlayHandler, "WINDOW")
         _overlayHandler = None
 
+    _removeDepsgraphHandler()
     _batchCache.clear()
     _overlayShader = None
 
@@ -46,12 +52,96 @@ def syncOverlayHandlerVisibility(windowManagerSettings, context):
                 area.tag_redraw()
 
 
+def _addDepsgraphHandler():
+    hasRegisteredHandler = any(
+        _isTransformLockOverlayHandler(depsgraphHandler)
+        for depsgraphHandler in bpy.app.handlers.depsgraph_update_post
+    )
+
+    if not hasRegisteredHandler:
+        bpy.app.handlers.depsgraph_update_post.append(_handleDepsgraphUpdate)
+
+
+def _removeDepsgraphHandler():
+    depsgraphHandlers = bpy.app.handlers.depsgraph_update_post
+
+    for depsgraphHandler in tuple(depsgraphHandlers):
+        if _isTransformLockOverlayHandler(depsgraphHandler):
+            depsgraphHandlers.remove(depsgraphHandler)
+
+
+def _isTransformLockOverlayHandler(depsgraphHandler):
+    return (
+        getattr(depsgraphHandler, "__module__", "") == __name__
+        and getattr(depsgraphHandler, "__name__", "") == "_handleDepsgraphUpdate"
+    )
+
+
+@persistent
+def _handleDepsgraphUpdate(scene, depsgraph):
+    if _overlayHandler is None:
+        return
+
+    shouldClearCache = False
+    shouldRedraw = False
+
+    try:
+        depsgraphUpdates = tuple(depsgraph.updates)
+    except ReferenceError:
+        _batchCache.clear()
+        _tagAllView3DAreasForRedraw()
+        return
+
+    for depsgraphUpdate in depsgraphUpdates:
+        try:
+            idType = depsgraphUpdate.id.id_type
+        except ReferenceError:
+            shouldClearCache = True
+            shouldRedraw = True
+            break
+
+        if (
+            getattr(depsgraphUpdate, "is_updated_geometry", False)
+            or idType in _clearCacheIdTypes
+        ):
+            shouldClearCache = True
+            shouldRedraw = True
+        elif (
+            getattr(depsgraphUpdate, "is_updated_transform", False)
+            or idType in _redrawIdTypes
+        ):
+            shouldRedraw = True
+
+    if shouldClearCache:
+        _batchCache.clear()
+
+    if shouldRedraw:
+        _tagAllView3DAreasForRedraw()
+
+
+def _tagAllView3DAreasForRedraw():
+    windowManager = bpy.context.window_manager
+
+    if windowManager is None:
+        return
+
+    for window in windowManager.windows:
+        screen = window.screen
+
+        if screen is None:
+            continue
+
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
 def _getOverlayShader():
     global _overlayShader
 
     if _overlayShader is None:
         shaderInfo = gpu.types.GPUShaderCreateInfo()
-        shaderInfo.push_constant("MAT4", "viewProjectionMatrix")
+        shaderInfo.push_constant("MAT4", "modelViewProjectionMatrix")
         shaderInfo.push_constant("FLOAT", "depthOffset")
         shaderInfo.push_constant("VEC3", "color")
         shaderInfo.push_constant("FLOAT", "opacity")
@@ -66,7 +156,7 @@ def _getOverlayShader():
             """
             void main()
             {
-                vec4 position = viewProjectionMatrix * vec4(pos, 1.0);
+                vec4 position = modelViewProjectionMatrix * vec4(pos, 1.0);
                 position.z -= depthOffset * position.w;
                 gl_Position = position;
             }
@@ -118,7 +208,7 @@ def _getOverlayShader():
     return _overlayShader
 
 
-def _getCachedMeshBatch(shader, depsgraph, transformSource, sourceObject):
+def _getCachedMeshBatch(shader, depsgraph, sourceObject):
     cacheKey = sourceObject.session_uid
     cachedEntry = _batchCache.get(cacheKey)
 
@@ -127,12 +217,12 @@ def _getCachedMeshBatch(shader, depsgraph, transformSource, sourceObject):
         if cachedDepsgraph == depsgraph:
             return cachedBatch
 
-    batch = _buildMeshBatch(shader, depsgraph, transformSource, sourceObject)
+    batch = _buildMeshBatch(shader, depsgraph, sourceObject)
     _batchCache[cacheKey] = (depsgraph, batch)
     return batch
 
 
-def _buildMeshBatch(shader, depsgraph, transformSource, sourceObject):
+def _buildMeshBatch(shader, depsgraph, sourceObject):
     evaluatedObject = sourceObject.evaluated_get(depsgraph)
     mesh = evaluatedObject.to_mesh()
 
@@ -140,7 +230,6 @@ def _buildMeshBatch(shader, depsgraph, transformSource, sourceObject):
         return None
 
     try:
-        mesh.transform(transformSource.matrix_world)
         mesh.calc_loop_triangles()
 
         if len(mesh.vertices) == 0 or len(mesh.loop_triangles) == 0:
@@ -154,7 +243,12 @@ def _buildMeshBatch(shader, depsgraph, transformSource, sourceObject):
         evaluatedObject.to_mesh_clear()
 
 
-def _drawOverlayStripes(shader, batch, opacity, activeLockFlags):
+def _drawOverlayStripes(
+    shader, batch, viewProjectionMatrix, transformMatrix, opacity, activeLockFlags
+):
+    shader.uniform_float(
+        "modelViewProjectionMatrix", viewProjectionMatrix @ transformMatrix
+    )
     shader.uniform_float("color", _lockOverlayColor)
     shader.uniform_float("opacity", opacity)
     shader.uniform_float("useLocation", 1.0 if activeLockFlags[0] else 0.0)
@@ -256,7 +350,6 @@ def _drawOverlay():
 
     try:
         shader.bind()
-        shader.uniform_float("viewProjectionMatrix", region3d.perspective_matrix)
         shader.uniform_float("depthOffset", _depthOffset)
         shader.uniform_float("stripeSpacing", _hatchSpacing)
         shader.uniform_float("stripeWidth", _stripeWidth)
@@ -264,12 +357,14 @@ def _drawOverlay():
         for transformSource, sourceObject, activeLockFlags in _iterateOverlayObjects(
             context, depsgraph, sceneSettings
         ):
-            batch = _getCachedMeshBatch(shader, depsgraph, transformSource, sourceObject)
+            batch = _getCachedMeshBatch(shader, depsgraph, sourceObject)
 
             if batch is not None:
                 _drawOverlayStripes(
                     shader,
                     batch,
+                    region3d.perspective_matrix,
+                    transformSource.matrix_world,
                     sceneSettings.transformLockOverlayOpacity,
                     activeLockFlags,
                 )
