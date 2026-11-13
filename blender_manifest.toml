@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "helpers"
-version = "0.2.0"
+version = "0.3.0"
 name = "Helpers"
 tagline = "A set of helper tools that simplifies everyday Blender workflows"
 maintainer = "Artem Viveritsa"

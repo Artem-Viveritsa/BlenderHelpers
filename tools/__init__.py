@@ -6,7 +6,7 @@ else:
     from . import moduleReload
 
 
-toolPackageNames = ("TransformLock", "LookAt")
+toolPackageNames = ("BackgroundTasks", "TransformLock", "LookAt", "Boolean")
 toolPackages = moduleReload.loadModules(__name__, toolPackageNames, locals())
 
 
